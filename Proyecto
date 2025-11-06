@@ -1,0 +1,272 @@
+// --- 1. LIBRERÍAS (Requeridas por la estructura inicial Modbus/LCD) ---
+#include <ModbusMaster.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- 2. CONFIGURACIÓN DE PINES ---
+
+// Pines Modbus (RS485) - Se mantienen para compatibilidad futura
+#define RX_PIN 2    // Pin 2 del Arduino conectado a RO del MAX485
+#define TX_PIN 3    // Pin 3 del Arduino conectado a DI del MAX485
+#define DE_RE_PIN 4 // Pin 4 del Arduino conectado a DE/RE (Control de dirección)
+
+// Pines de Interfaz
+#define BTN_NEXT_PIN 7 // Botón único de avance (conectado a GND usando INPUT_PULLUP)
+#define LED_ROJO_PIN 5 // LED de Alerta (Fuera de rango)
+#define LED_VERDE_PIN 6 // LED de Normalidad (Dentro de rango)
+
+// Inicialización de módulos
+SoftwareSerial rs485Serial(RX_PIN, TX_PIN); 
+ModbusMaster node; 
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// --- 3. VARIABLES GLOBALES DE ESTADO Y VALORES ---
+
+// Variables para almacenar los valores del sensor (Simulados)
+float moisture_val = 0.0; // Humedad (%)
+float temp_val = 0.0;     // Temperatura (C)
+float ec_val = 0.0;       // Conductividad Eléctrica (uS/cm)
+float ph_val = 0.0;       // pH
+float n_val = 0.0;        // Nitrógeno (ppm)
+float p_val = 0.0;        // Fósforo (ppm)
+float k_val = 0.0;        // Potasio (ppm)
+
+// Variables de Control de Vistas y Exclusión Mutua
+uint8_t vistaActual = 1;      // Inicia en la primera vista
+const int totalVistas = 7;    // Número total de parámetros a mostrar
+bool manualChangeExecuted = false; // Bandera para evitar doble salto (manual/automático)
+
+// Variables de Anti-rebote y Control de Tiempo
+unsigned long lastDebounceTime = 0;
+const long debounceDelay = 200; // Tiempo de anti-rebote estable
+unsigned long lastModbusRead = 0;
+const unsigned long readInterval = 5000; // Simular lectura cada 5 segundos
+unsigned long lastViewChange = 0;
+const unsigned long viewInterval = 4000; // Ciclo automático cada 4 segundos
+
+// --- 4. UMBRALES DE ALERTA (Límite para LEDs) ---
+
+// Humedad (Fuera de rango = Alerta)
+const float UMBRAL_MOISTURE_MIN = 30.0;
+const float UMBRAL_MOISTURE_MAX = 70.0;
+
+// Temperatura (Fuera de rango = Alerta)
+const float UMBRAL_TEMP_MIN = 15.0;
+const float UMBRAL_TEMP_MAX = 35.0;
+
+// Conductividad Eléctrica (Fuera de rango = Alerta)
+const float UMBRAL_EC_MIN = 300.0;
+const float UMBRAL_EC_MAX = 2000.0;
+
+// pH (Rango ideal entre 5.5 y 7.5)
+const float UMBRAL_PH_MIN = 5.5;
+const float UMBRAL_PH_MAX = 7.5;
+
+// Nutrientes (N, P, K) - Demasiado BAJO = Alerta (requiere fertilizante)
+const float UMBRAL_NUTRIENT_MIN = 50.0; // Aplica a N, P, K
+
+// --- 5. FUNCIONES DE LÓGICA Y PERIFÉRICOS ---
+
+// (Funciones Modbus vacías pero necesarias para que la librería compile)
+void preTransmission() { digitalWrite(DE_RE_PIN, HIGH); }
+void postTransmission() { digitalWrite(DE_RE_PIN, LOW); }
+
+//Función que SIMULA la lectura del sensor.
+//Genera valores aleatorios para los 7 parámetros dentro de rangos realistas.
+
+void simularLecturaSensor() {
+    // Generación de valores aleatorios realistas
+    randomSeed(micros()); // Inicializa la semilla aleatoria
+
+    // Rango general de valores simulados
+    moisture_val = random(100, 950) / 10.0; 
+    temp_val = random(100, 400) / 10.0; 
+    ec_val = random(100, 3000) / 1.0; 
+    ph_val = random(40, 90) / 10.0;
+    n_val = random(10, 500) / 1.0; 
+    p_val = random(10, 500) / 1.0; 
+    k_val = random(10, 500) / 1.0; 
+}
+
+//Controla el encendido de los LEDs ROJO o VERDE según el umbral.
+//La alerta se basa en la vista actual (vistaActual).
+
+void manejarLEDsDeAlerta() {
+    bool alerta = false;
+    
+    // El LED se enciende o apaga según la vista actual
+    switch (vistaActual) {
+        case 1: // Humedad
+            if (moisture_val < UMBRAL_MOISTURE_MIN || moisture_val > UMBRAL_MOISTURE_MAX) alerta = true;
+            break;
+        case 2: // Temperatura
+            if (temp_val < UMBRAL_TEMP_MIN || temp_val > UMBRAL_TEMP_MAX) alerta = true;
+            break;
+        case 3: // EC
+            if (ec_val < UMBRAL_EC_MIN || ec_val > UMBRAL_EC_MAX) alerta = true;
+            break;
+        case 4: // pH (Es un rango, no solo un máximo)
+            if (ph_val < UMBRAL_PH_MIN || ph_val > UMBRAL_PH_MAX) alerta = true;
+            break;
+        case 5: // Nitrógeno (N) - Alerta solo si es demasiado bajo
+            if (n_val < UMBRAL_NUTRIENT_MIN) alerta = true;
+            break;
+        case 6: // Fósforo (P) - Alerta solo si es demasiado bajo
+            if (p_val < UMBRAL_NUTRIENT_MIN) alerta = true;
+            break;
+        case 7: // Potasio (K) - Alerta solo si es demasiado bajo
+            if (k_val < UMBRAL_NUTRIENT_MIN) alerta = true;
+            break;
+    }
+
+    // Control de salida de LEDs
+    if (alerta) {
+        digitalWrite(LED_ROJO_PIN, HIGH);
+        digitalWrite(LED_VERDE_PIN, LOW);
+    } else {
+        digitalWrite(LED_ROJO_PIN, LOW);
+        digitalWrite(LED_VERDE_PIN, HIGH);
+    }
+}
+
+
+//Dibuja el parámetro actual en el LCD.
+
+void actualizarLCD() {
+    lcd.clear(); 
+    
+    switch (vistaActual) {
+        case 1: 
+            lcd.print("Humedad");
+            lcd.setCursor(0, 1);
+            lcd.print(moisture_val, 1);
+            lcd.print("%");
+            break;
+        case 2:
+            lcd.print("Temperatura");
+            lcd.setCursor(0, 1);
+            lcd.print(temp_val, 1);
+            lcd.print(" C");
+            break;
+        case 3: 
+            lcd.print("EC");
+            lcd.setCursor(0, 1);
+            lcd.print(ec_val, 0); 
+            lcd.print(" uS/cm");
+            break;
+        case 4: 
+            lcd.print("pH");
+            lcd.setCursor(0, 1);
+            lcd.print(ph_val, 2);
+            break;
+        case 5: 
+            lcd.print("Nitrogeno (N)");
+            lcd.setCursor(0, 1);
+            lcd.print(n_val, 0);
+            lcd.print(" ppm");
+            break;
+        case 6: 
+            lcd.print("Fosforo (P)");
+            lcd.setCursor(0, 1);
+            lcd.print(p_val, 0);
+            lcd.print(" ppm");
+            break;
+        case 7: 
+            lcd.print("Potasio (K)");
+            lcd.setCursor(0, 1);
+            lcd.print(k_val, 0);
+            lcd.print(" ppm");
+            break;
+    }
+    // Llama a la alerta después de actualizar el LCD para que sea instantánea
+    manejarLEDsDeAlerta(); 
+}
+
+
+//Maneja el botón de avance (Pin 7).
+//Vuelve TRUE si se ejecutó un cambio manual.
+
+bool manejarBotones() {
+    int btnNext = digitalRead(BTN_NEXT_PIN); 
+
+    // A. Lógica de pulsación simple con Debounce
+    if (btnNext == LOW) { 
+        if (millis() - lastDebounceTime > debounceDelay) {
+            
+            lastDebounceTime = millis(); // Resetea el tiempo para la próxima pulsación
+            
+            vistaActual++;
+            if (vistaActual > totalVistas) {
+                vistaActual = 1; // Vuelve a la primera vista
+            }
+            
+            actualizarLCD();
+            
+            // Si el botón se usó, se retorna TRUE para detener el ciclo automático
+            return true; 
+        }
+    }
+    return false; // No hubo cambio manual o la pulsación fue ignorada por debounce
+}
+
+// --- 6. SETUP Y LOOP ---
+
+void setup() {
+    // Inicialización de comunicación y pines
+    Serial.begin(9600); 
+    rs485Serial.begin(9600);
+    pinMode(DE_RE_PIN, OUTPUT);
+    pinMode(BTN_NEXT_PIN, INPUT_PULLUP); // Botón a tierra
+    pinMode(LED_ROJO_PIN, OUTPUT);
+    pinMode(LED_VERDE_PIN, OUTPUT);
+    digitalWrite(DE_RE_PIN, LOW); 
+
+    // Inicialización de Modbus (mantener la estructura)
+    node.begin(1, rs485Serial); 
+    node.preTransmission(preTransmission);
+    node.postTransmission(postTransmission);
+
+    // Inicialización del LCD
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.print("Monitor 7 en 1");
+    lcd.setCursor(0, 1);
+    lcd.print("Cargando...");
+    
+    // Primera simulación de datos al inicio
+    simularLecturaSensor();
+    actualizarLCD(); // Muestra V1 con los primeros datos
+    
+    lastViewChange = millis(); // Inicializa el temporizador de vista
+}
+
+void loop() {
+    // 1. Manejo de botones (La prioridad de respuesta)
+    // Almacena si hubo una pulsación manual para la exclusión mutua
+    manualChangeExecuted = manejarBotones();
+
+    // 2. Lectura periódica (Simulación) - Programación no bloqueante
+    if (millis() - lastModbusRead >= readInterval) { 
+        lastModbusRead = millis();
+        simularLecturaSensor(); 
+        
+        // La actualización de la alerta y el LCD se maneja en el siguiente paso
+    }
+
+    // 3. CICLO AUTOMÁTICO DE VISTAS (Cada 4 segundos) - Programación no bloqueante
+    if (millis() - lastViewChange >= viewInterval) {
+        
+        // Bloquea el avance automático si se detectó una pulsación manual en esta iteración.
+        if (!manualChangeExecuted) { 
+            lastViewChange = millis();
+
+            vistaActual++;
+            if (vistaActual > totalVistas) {
+                vistaActual = 1; // Vuelve a la primera vista
+            }
+            
+            actualizarLCD(); // Muestra la nueva vista
+        }
+    }
+}
